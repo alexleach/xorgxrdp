@@ -30,26 +30,30 @@
     do { if (_level < LOG_LEVEL) { ErrorF _args ; ErrorF("\n"); } } while (0)
 
 /* 
-            start   end
-crtc ids    1       16
-output ids  17      32
-mode ids    33      48
+             start   end
+crtc ids     1       16
+output ids   17      32
+mode ids     33      48
+provider ids 49      64
 */
 
 #define LRANDR_NAME                     "RANDR"
 #define SERVER_LRANDR_MAJOR_VERSION     1
-#define SERVER_LRANDR_MINOR_VERSION     3
+#define SERVER_LRANDR_MINOR_VERSION     4
 #define LRRNumberEvents                 2
 #define LRRNumberErrors                 4
-#define LRRNumberRequests               32 /* 1.3 */
+#define LRRNumberRequests               42 /* 1.4 */
 #define LRRMaxCrtcs                     16
 #define LRRMaxOutputs                   16
 #define LRRMaxOutputNameLength          16
+#define LRRMaxProviders                 16
+#define LRRMaxProviderNameLength        16
 #define LRRMaxModes                     16
 #define LRRMaxModesNameLength           16
 #define LRRCrtcStart                    1
 #define LRROutputStart                  17
 #define LRRModeStart                    33
+#define LRRProviderStart                49
 
 #define OUTPUT2CRTC(_output)    ((_output) - LRRMaxCrtcs)
 #define OUTPUT2MODE(_output)    ((_output) + LRRMaxOutputs)
@@ -83,12 +87,26 @@ struct _LRROutputRec
 };
 typedef struct _LRROutputRec LRROutputRec;
 
+struct _LRRProviderRec
+{
+    RRProvider id;
+    CARD32 capabilities;
+    int nCrtcs;
+    int nOutputs;
+    int nAssociatedProviders;
+    int nameLength;
+};
+typedef struct _LRRProviderRec LRRProviderRec;
+
 static int g_numCrtcs = 0;
 static LRRCrtcRec g_crtcs[LRRMaxCrtcs];
 
 static int g_numOutputs = 0;
 static LRROutputRec g_outputs[LRRMaxOutputs];
 static RROutput g_primaryOutput = None; /* XID */
+
+static int g_numProviders = 0;
+static LRRProviderRec g_providers[LRRMaxProviders];
 
 static int g_numModes = 0;
 static xRRModeInfo g_modes[LRRMaxModes];
@@ -223,6 +241,78 @@ LRRDeliverOutputEvent(interestedClientRec *ic, LRROutputRec *pOutput)
 }
 
 /******************************************************************************/
+static int
+LRRDeliverProviderEvent(interestedClientRec *ic, LRRProviderRec *pProvider)
+{
+    xRRProviderChangeNotifyEvent oe;
+    WindowPtr pWin;
+
+    LLOGLN(10, ("LRRDeliverProviderEvent:              client %p", ic->pClient));
+    if (dixLookupWindow(&pWin, ic->window, ic->pClient,
+                        DixGetAttrAccess) != Success)
+    {
+        return 1;
+    }
+    memset(&oe, 0, sizeof(oe));
+    oe.type = RRNotify + LRREventBase;
+    oe.subCode = RRNotify_ProviderChange;
+    oe.timestamp = g_updateTime;
+    oe.window = ic->window;
+    oe.provider = pProvider->id;
+    WriteEventsToClient(ic->pClient, 1, (xEvent *) &oe);
+    return 0;
+}
+
+/******************************************************************************/
+static int
+LRRDeliverProviderPropertyEvent(interestedClientRec *ic, LRRProviderRec *pProvider)
+{
+    xRRProviderPropertyNotifyEvent oe;
+    WindowPtr pWin;
+
+    LLOGLN(10, ("LRRDeliverProviderPropertyEvent:              client %p", ic->pClient));
+    if (dixLookupWindow(&pWin, ic->window, ic->pClient,
+                        DixGetAttrAccess) != Success)
+    {
+        return 1;
+    }
+    memset(&oe, 0, sizeof(oe));
+    oe.type = RRNotify + LRREventBase;
+    oe.subCode = RRNotify_ProviderProperty;
+    oe.timestamp = g_updateTime;
+    oe.window = ic->window;
+    oe.provider = pProvider->id;
+
+    // oe.atom  ?
+    // oe.state ?
+
+    WriteEventsToClient(ic->pClient, 1, (xEvent *) &oe);
+    return 0;
+}
+
+/******************************************************************************/
+static int
+LRRDeliverResourceEvent(interestedClientRec *ic, LRRProviderRec *pProvider)
+{
+    xRRResourceChangeNotifyEvent oe;
+    WindowPtr pWin;
+
+    LLOGLN(10, ("LRRDeliverResourceEvent:              client %p", ic->pClient));
+    if (dixLookupWindow(&pWin, ic->window, ic->pClient,
+                        DixGetAttrAccess) != Success)
+    {
+        return 1;
+    }
+    memset(&oe, 0, sizeof(oe));
+    oe.type = RRNotify + LRREventBase;
+    oe.subCode = RRNotify_ResourceChange;
+    oe.timestamp = g_updateTime;
+    oe.window = ic->window;
+    WriteEventsToClient(ic->pClient, 1, (xEvent *) &oe);
+    return 0;
+}
+
+/******************************************************************************/
 /* 0 */
 /*  RRQueryVersion
         client-major-version:    CARD32
@@ -296,7 +386,12 @@ ProcLRRSelectInput(ClientPtr client)
     if (stuff->enable & (RRScreenChangeNotifyMask |
                          RRCrtcChangeNotifyMask |
                          RROutputChangeNotifyMask |
-                         RROutputPropertyNotifyMask))
+                         RROutputPropertyNotifyMask |
+                         /** New for version 1.4 */
+                         RRProviderChangeNotifyMask |
+                         RRProviderPropertyNotifyMask |
+                         RRResourceChangeNotifyMask
+                         ))
     {
         ic = (interestedClientRec *) calloc(1, sizeof(interestedClientRec));
         if (ic == NULL)
@@ -964,6 +1059,261 @@ ProcLRRGetOutputPrimary(ClientPtr client)
 }
 
 /******************************************************************************/
+/* 32 */
+/* RRGetProviders
+      window: WINDOW
+      x
+      timestamp: TIMESTAMP
+      providers: LISTofPROVIDER */
+int
+ProcLRRGetProviders(ClientPtr client)
+{
+    int index;
+    CARD8 *extra;
+    unsigned long extraLen;
+    RRProvider *providers;
+
+    xRRGetProvidersReply rep;
+    REQUEST(xRRGetProvidersReq);
+
+    (void) stuff;
+
+    LLOGLN(10, ("ProcLRRGetProviders:            client %p", client));
+    REQUEST_SIZE_MATCH(xRRGetProvidersReq);
+    memset(&rep, 0, sizeof(rep));
+    rep.type = X_Reply;
+    rep.sequenceNumber = client->sequence;
+    rep.nProviders = g_numProviders;
+    rep.timestamp = g_updateTime;
+
+    rep.length = g_numProviders * bytes_to_int32(sizeof(RRProvider));
+    extraLen = rep.length << 2;
+    if (extraLen != 0)
+    {
+        extra = (CARD8 *) calloc(1, extraLen);
+        if (extra == NULL)
+        {
+            return BadAlloc;
+        }
+    }
+    else
+    {
+        extra = NULL;
+    }
+    LLOGLN(10, ("ProcLRRGetScreenResources: extraLen %d", (int) extraLen));
+    providers = (RRProvider *) extra;
+    for (index = 0; index < g_numProviders; index++)
+    {
+        providers[index] = g_providers[index].id;
+    }
+
+    WriteToClient(client, sizeof(rep), &rep);
+    if (extraLen != 0)
+    {
+        WriteToClient(client, extraLen, extra);
+        free(extra);
+    }
+
+    return Success;
+}
+
+/******************************************************************************/
+/* 33 */
+/* LRRGetProviderInfo
+   	provider: PROVIDER
+     x
+    capabilities: PROVIDER_CAPS
+    name: STRING
+    crtcs: LISTofCRTC
+    outputs: LISTofOUTPUT
+    associated_providers: LISTofPROVIDERS
+    associated_provider_capability: LISTofPROVIDER_CAPS */
+int
+ProcLRRGetProviderInfo(ClientPtr client)
+{
+    xRRGetProviderInfoReply rep;
+    REQUEST(xRRGetProviderInfoReq);
+    LRRProviderRec *provider;
+
+    (void) stuff;
+
+    // RROutput output;
+    // LRRCrtcRec *crtc;
+    // xRRGetCrtcInfoReply rep;
+    // REQUEST(xRRGetCrtcInfoReq);
+    // LLOGLN(10, ("ProcLRRGetCrtcInfo:                 client %p crtc %d", client, stuff->crtc));
+    // REQUEST_SIZE_MATCH(xRRGetCrtcInfoReq);
+
+    LLOGLN(10, ("ProcLRRGetProviderInfo:            client %p", client));
+    REQUEST_SIZE_MATCH(xRRGetProviderInfoReq);
+    if ((stuff->provider < LRRProviderStart) ||
+        (stuff->provider >= LRRProviderStart + LRRMaxProviders))
+    {
+        return BadRequest;
+    }
+    provider = g_providers + (stuff->provider - LRRProviderStart);
+
+    memset(&rep, 0, sizeof(rep));
+    rep.type = X_Reply;
+    rep.status = RRSetConfigSuccess;
+    rep.sequenceNumber = client->sequence;
+
+    rep.length = bytes_to_int32(SIZEOF(xRRGetProviderInfoReply));
+    rep.timestamp = g_updateTime;
+
+    rep.capabilities = provider->capabilities;
+    rep.nCrtcs = provider->nCrtcs;
+    rep.nOutputs = provider->nOutputs;
+    rep.nAssociatedProviders = provider->nAssociatedProviders;
+    rep.nameLength = provider->nameLength;
+
+    WriteToClient(client, sizeof(rep), &rep);
+    return Success;
+}
+
+/******************************************************************************/
+/* 34 */
+/* LRRSetProviderOffloadSink
+   	provider: PROVIDER
+    sink_provider: PROVIDER
+    config-timestamp: TIMESTAMP */
+int
+ProcLRRSetProviderOffloadSink(ClientPtr client)
+{
+    LLOGLN(10, ("ProcLRRSetProviderOffloadSink:            client %p", client));
+    return Success;
+}
+
+/******************************************************************************/
+/* 35 */
+/* LRRSetProviderOutputSource
+    provider: PROVIDER
+    source_provider: PROVIDER
+    config-timestamp: TIMESTAMP */
+int
+ProcLRRSetProviderOutputSource(ClientPtr client)
+{
+    LLOGLN(10, ("ProcLRRSetProviderOutputSource:            client %p", client));
+    return Success;
+}
+
+/******************************************************************************/
+/* 36 */
+/* LRRListProviderProperties
+   	provider:PROVIDERS
+     x
+	  atoms: LISTofATOM*/
+int
+ProcLRRListProviderProperties(ClientPtr client)
+{
+    xRRListProviderPropertiesReply rep;
+    REQUEST(xRRListProviderPropertiesReq);
+
+    (void) stuff;
+
+    LLOGLN(10, ("ProcLRRListProviderProperties:            client %p", client));
+    REQUEST_SIZE_MATCH(xRRListProviderPropertiesReq);
+    memset(&rep, 0, sizeof(rep));
+    rep.type = X_Reply;
+    rep.sequenceNumber = client->sequence;
+    WriteToClient(client, sizeof(rep), &rep);
+    return Success;
+}
+
+/******************************************************************************/
+/* 37 */
+/* LRRQueryProviderProperty
+   	provider: PROVIDER
+	  property: ATOM
+     x
+    pending: BOOL
+    range: BOOL
+    immutable: BOOL
+    valid-values: LISTofINT32 */
+int
+ProcLRRQueryProviderProperty(ClientPtr client)
+{
+    xRRQueryProviderPropertyReply rep;
+
+    LLOGLN(10, ("ProcLRRQueryProviderProperty:            client %p", client));
+    //REQUEST_SIZE_MATCH(xRRQueryProviderPropertyReq);
+    memset(&rep, 0, sizeof(rep));
+    rep.type = X_Reply;
+    rep.sequenceNumber = client->sequence;
+    //rep.length = bytes_to_int32(OutputInfoExtra);
+    //rep.pending = stuff->pending;
+    //rep.range = stuff->range;
+    //rep.immutable = stuff->immutable
+
+    WriteToClient(client, sizeof(rep), &rep);
+    return Success;
+}
+
+/******************************************************************************/
+/* 38 */
+/* LRRConfigureProviderProperty
+    provider: PROVIDER
+    property: ATOM
+    pending: BOOL
+    range: BOOL
+    valid-values: LISTofINT32 */
+int
+ProcLRRConfigureProviderProperty(ClientPtr client)
+{
+    LLOGLN(10, ("ProcLRRConfigureProviderProperty:            client %p", client));
+    return Success;
+}
+
+/******************************************************************************/
+/* 39 */
+/* LRRChangeProviderProperty
+    provider: PROVIDER
+    property, type: ATOM
+    format: {8, 16, 32}
+    mode: { Replace, Prepend, Append }
+    data: LISTofINT8 or LISTofINT16 or LISTofINT32 */
+int
+ProcLRRChangeProviderProperty(ClientPtr client)
+{
+    LLOGLN(10, ("ProcLRRChangeProviderProperty:            client %p", client));
+    return Success;
+}
+
+/******************************************************************************/
+/* 40 */
+/* LRRDeleteProviderProperty
+    provider: Provider
+	  property: ATOM */
+int
+ProcLRRDeleteProviderProperty(ClientPtr client)
+{
+    LLOGLN(10, ("ProcLRRDeleteProviderProperty:            client %p", client));
+    return Success;
+}
+
+/******************************************************************************/
+/* 41 */
+/* LRRGetProviderProperty
+    provider: PROVIDER
+    property: ATOM
+    type: ATOM or AnyPropertyType
+    long-offset, long-length: CARD32
+    delete: BOOL
+    pending: BOOL
+     x
+    type: ATOM or None
+    format: {0, 8, 16, 32}
+    bytes-after: CARD32
+    value: LISTofINT8 or LISTofINT16 or LISTofINT32 */
+int
+ProcLRRGetProviderProperty(ClientPtr client)
+{
+    LLOGLN(10, ("ProcLRRGetProviderProperty:            client %p", client));
+    return Success;
+}
+
+
+/******************************************************************************/
 static int
 ProcLRRDispatch(ClientPtr client)
 {
@@ -1067,6 +1417,11 @@ rdpLRRInit(rdpPtr dev)
         g_modes[index].id = index + LRRModeStart;
     }
 
+    for (index = 0; index < LRRMaxProviders; index++)
+    {
+        g_providers[index].id = index + LRRProviderStart;
+    }
+
     xorg_list_init(&g_interestedClients);
 
     memset(g_procLRandrVector, 0, sizeof(g_procLRandrVector));
@@ -1102,6 +1457,18 @@ rdpLRRInit(rdpPtr dev)
     //g_procLRandrVector[29] = ProcLRRSetPanning; TODO
     //g_procLRandrVector[30] = ProcLRRSetOutputPrimary; ok
     g_procLRandrVector[31] = ProcLRRGetOutputPrimary;
+
+    /* V1.4 additions */
+    g_procLRandrVector[32] = ProcLRRGetProviders;
+    g_procLRandrVector[33] = ProcLRRGetProviderInfo;
+    g_procLRandrVector[34] = ProcLRRSetProviderOffloadSink;
+    g_procLRandrVector[35] = ProcLRRSetProviderOutputSource;
+    g_procLRandrVector[36] = ProcLRRListProviderProperties;
+    g_procLRandrVector[37] = ProcLRRQueryProviderProperty;
+    g_procLRandrVector[38] = ProcLRRConfigureProviderProperty;
+    g_procLRandrVector[39] = ProcLRRChangeProviderProperty;
+    g_procLRandrVector[40] = ProcLRRDeleteProviderProperty;
+    g_procLRandrVector[41] = ProcLRRGetProviderProperty;
 
     rdpLRRSetRdpOutputs(dev);
     return 0;
@@ -1388,6 +1755,65 @@ rdpLRRSetRdpOutputs(rdpPtr dev)
             for (index = 0; index < g_numOutputs; index++)
             {
                 if (LRRDeliverOutputEvent(iterator, g_outputs + index) != 0)
+                {
+                    LLOGLN(0, ("rdpLRRSetRdpOutputs: error removing from "
+                           "interested list"));
+                    xorg_list_del(&(iterator->entry));
+                    free(iterator);
+                    cont = 1;
+                    break;
+                }
+            }
+            if (cont)
+            {
+                continue;
+            }
+        }
+
+        /* RANDR 1.4 Support */
+        if (iterator->mask & RRProviderChangeNotifyMask)
+        {
+            for (index = 0; index < g_numProviders; index++)
+            {
+                if (LRRDeliverProviderEvent(iterator, g_providers + index) != 0)
+                {
+                    LLOGLN(0, ("rdpLRRSetRdpOutputs: error removing from "
+                           "interested list"));
+                    xorg_list_del(&(iterator->entry));
+                    free(iterator);
+                    cont = 1;
+                    break;
+                }
+            }
+            if (cont)
+            {
+                continue;
+            }
+        }
+        if (iterator->mask & RRProviderPropertyNotifyMask)
+        {
+            for (index = 0; index < g_numProviders; index++)
+            {
+                if (LRRDeliverProviderPropertyEvent(iterator, g_providers + index) != 0)
+                {
+                    LLOGLN(0, ("rdpLRRSetRdpOutputs: error removing from "
+                           "interested list"));
+                    xorg_list_del(&(iterator->entry));
+                    free(iterator);
+                    cont = 1;
+                    break;
+                }
+            }
+            if (cont)
+            {
+                continue;
+            }
+        }
+        if (iterator->mask & RRResourceChangeNotifyMask)
+        {
+            for (index = 0; index < g_numProviders; index++)
+            {
+                if (LRRDeliverResourceEvent(iterator, g_providers + index) != 0)
                 {
                     LLOGLN(0, ("rdpLRRSetRdpOutputs: error removing from "
                            "interested list"));
